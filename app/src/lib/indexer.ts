@@ -25,11 +25,11 @@ import { decodeInputData } from "genlayer-js";
 import { CONTRACT_ADDRESS } from "./genlayer";
 import { fetchRaw, jaccardBp, normalize } from "./github";
 
-// The explorer API sends no CORS headers, so in dev it is reached through the
-// Vite proxy declared in vite.config.ts.
-const EXPLORER_API = import.meta.env.DEV
-  ? "/explorer/api/v1"
-  : "https://explorer-bradbury.genlayer.com/api/v1";
+// The explorer API answers fine but sends no Access-Control-Allow-Origin, so a
+// browser refuses to hand us the response. It is always reached through a
+// same-origin proxy: vite.config.ts in dev, the rewrite in vercel.json in
+// production. Calling the explorer host directly works nowhere except curl.
+const EXPLORER_API = "/explorer/api/v1";
 
 const LICENSE_CANDIDATES = [
   "LICENSE",
