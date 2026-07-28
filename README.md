@@ -1,0 +1,228 @@
+# LicenseHound
+
+A bounty court for open-source licence compliance, running on GenLayer Testnet Bradbury.
+
+A maintainer funds a **watch** on a repository they own. A hunter posts a bond and files a
+**claim**: "this other project shipped your code without preserving your licence." The
+contract then fetches both code bases itself, measures how much they overlap, checks
+whether the licence was preserved, and asks the validator network the single question
+arithmetic cannot answer — *is this a derivative work?* The escrow settles on the answer,
+and the result is written down as a permanent **Evidence Receipt**.
+
+**Live on Bradbury:** [`0xB27C1896E7Dd6dEcFba355B79De2A4B1e31a339c`](https://explorer-bradbury.genlayer.com/address/0xB27C1896E7Dd6dEcFba355B79De2A4B1e31a339c)
+
+---
+
+## Why this needs GenLayer
+
+Everything about a licence violation is checkable except the part that matters. Whether two
+files overlap is arithmetic. Whether a licence file was shipped is string comparison. But
+*"is this a derivative work, or do these two files just both call the same API"* is a
+judgment — and a judgment that only counts if the accused party cannot dismiss it as one
+biased person's opinion.
+
+That is what the network is for. Five validators answer the question independently and the
+transaction settles only if their answers agree. Nobody has to trust the maintainer, the
+hunter, or whoever ran the model.
+
+## The design decision that makes it work
+
+The first version asked the model for four things at once — verdict, derivative,
+attribution, and the list of infringing files — and pasted every code excerpt into the
+prompt twice. On Bradbury that produced:
+
+```
+status=UNDETERMINED  result=NO_MAJORITY
+votes: 1 finished_with_return, 2 nondet_disagree, 2 timeout
+```
+
+Two validators timed out on the oversized prompt and two disagreed on a four-field exact
+match. So the design changed: **push determinism as far up as it will go, and leave the
+model exactly one boolean.**
+
+| Stage | Question | Answered by | Equivalence principle |
+|---|---|---|---|
+| 1 | What is in these two files? | `gl.nondet.web.get` at a pinned commit SHA | `strict_eq` |
+| 2 | How much do they overlap? | integer Jaccard over 5-token shingles | `strict_eq` |
+| 3 | Was the licence preserved? | the suspect's licence text vs the original's | `strict_eq` |
+| 4 | Is this a derivative work? | **the model — one boolean** | `prompt_comparative` |
+| 5 | What is the verdict, who gets paid? | derivation + vetoes, in code | deterministic |
+
+Re-run on Bradbury with that shape:
+
+| Claim | Case | Consensus | Verdict |
+|---|---|---|---|
+| #0 | `yt-dlp/yt-dlp` vs `ytdl-org/youtube-dl` | 4/5 agree | **COMPLIANT** — derivative, licence preserved |
+| #1 | `psf/requests` vs `ytdl-org/youtube-dl` | 5/5 agree | **UNRELATED** — the hunter loses half the bond |
+
+Claim #1 is the interesting one: the contract refused to rubber-stamp an accusation and
+charged the accuser for making it.
+
+### Pinning to a commit SHA
+
+Every fetch goes to `raw.githubusercontent.com/{repo}/{40-hex-sha}/{path}`, never a branch.
+A branch is mutable, so two validators fetching it seconds apart can read different bytes
+and consensus dies. Content addressed by SHA is immutable, which is what turns "fetch the
+evidence" into a reproducible read that `strict_eq` can wrap. The contract rejects anything
+that is not a full 40-character SHA; resolving `owner/repo@main` into one is the frontend's
+job.
+
+### Deterministic vetoes
+
+A model that says "derivative" about two files sharing 3% of their tokens must not be able
+to move money. After the vote, the contract overrides:
+
+- `VIOLATION` + similarity below 15% + nothing byte-identical → `INCONCLUSIVE`
+- `UNRELATED` + a byte-identical file pair → `INCONCLUSIVE`
+
+## Architecture boundary
+
+| | owns |
+|---|---|
+| **Frontend** | UI, branch→SHA resolution, non-authoritative similarity previews, indexing |
+| **Contract** | escrow, evidence acquisition, the judgment, settlement, the receipt |
+| **GitHub** | raw facts, trusted by nobody — every validator re-fetches independently |
+| **Wallet** | keys and signatures — the page never sees either |
+
+## Wallet
+
+The app holds no private key and offers no way to paste one in. Wallets are
+discovered over **EIP-6963**, so each installed extension announces itself and the user
+picks the one they mean — rather than the app assuming `window.ethereum` is the right
+wallet, which stops being true the moment two extensions are installed. A pre-6963 wallet
+still shows up through the `window.ethereum` fallback.
+
+The GenLayer client is built with an **address**, never an account object:
+
+```ts
+createClient({ chain: testnetBradbury, account: address, provider })
+```
+
+genlayer-js sees a non-object account and routes `eth_sendTransaction` to the provider, so
+every signature happens inside the wallet. No GenLayer MetaMask Snap is required — a
+LicenseHound transaction is an ordinary EVM call to the consensus contract.
+
+The adapter also handles what wallets actually do in practice: it switches to chain 4221
+(adding it via `wallet_addEthereumChain` if the wallet has never seen it), warns in a
+banner when the wallet drifts to another network, follows `accountsChanged` and
+`chainChanged`, and silently resumes the last-used wallet through `eth_accounts` if it is
+still authorised. Write actions are gated on being connected *and* on the right chain;
+triggering one while disconnected opens the wallet picker instead of failing.
+
+`app/scripts/ops.mjs` is the exception and stays key-based on purpose — it is an operator
+CLI, not the app, and reads its key from the gitignored `.env`.
+
+---
+
+## Repository layout
+
+```
+contracts/license_hound.py      the intelligent contract
+tests/direct/                   direct-mode tests (11, ~0.4s, no server)
+app/                            Vite + React + genlayer-js frontend
+app/src/lib/wallet.ts           EIP-6963 wallet adapter (discovery, chain, events)
+app/src/lib/indexer.ts          rebuilds state from the chain's transaction record
+app/scripts/ops.mjs             operator CLI for payable calls
+app/scripts/verdict.mjs         recovers a decision from a transaction
+```
+
+## Running it
+
+```bash
+npm install --prefix app
+```
+
+```bash
+npm run dev --prefix app
+```
+
+The contract address lives in `app/.env.local`. Connect a wallet in the UI — the app has no
+key input and never stores one. `.env` holds keys for the operator scripts only and is
+gitignored.
+
+### Contract workflow
+
+```bash
+genvm-lint check contracts/license_hound.py
+```
+
+```bash
+python -m pytest tests/direct/ -q
+```
+
+```bash
+genlayer deploy --contract contracts/license_hound.py
+```
+
+### Operator commands
+
+`genlayer write` cannot attach value and every money-moving method here is payable, so
+scripted operations go through genlayer-js:
+
+```bash
+node app/scripts/ops.mjs open-watch ytdl-jsinterp ytdl-org/youtube-dl 956b8c585591b401a543e409accb163eeaaa1193 Unlicense 0.4
+```
+
+```bash
+AS=hunter node app/scripts/ops.mjs claim ytdl-jsinterp yt-dlp/yt-dlp fdcc954df4955267ec1627cbeb347b661a110e7c 0.2 "youtube_dl/jsinterp.py::yt_dlp/jsinterp.py"
+```
+
+```bash
+node app/scripts/ops.mjs judge 0
+```
+
+`AS=hunter` switches identity: the contract will not let a watch owner file a claim on
+their own watch, so exercising the full flow needs two accounts.
+
+---
+
+## Known network limitation
+
+**Bradbury's public RPC currently serves writes but not contract state reads.** Its GenVM
+index sits several hundred thousand blocks behind the chain head:
+
+```
+requested block 15865053 is ahead of GenVM synced block 15467203
+(397850 blocks behind): genvm not synced
+```
+
+Consequently `gen_call` answers *"contract not found"* for **every** contract on the
+network — verified against three unrelated contracts from the explorer's list, not just
+this one. `genlayer call`, `genlayer schema`, and the trace endpoint are all affected.
+
+The app does not wait for that. `app/src/lib/indexer.ts` rebuilds its view instead:
+
+1. list the contract's transactions from the explorer index,
+2. decode each one's calldata to recover the arguments that were submitted,
+3. lift the one non-deterministic value the network actually voted on — the model's
+   `derivative` boolean — out of the consensus record,
+4. recompute every deterministic input locally and derive the verdict with the contract's
+   own rules.
+
+Step 4 is only legitimate because those stages are deterministic by construction: if
+recomputing them locally could disagree with the validators, `strict_eq` would have
+rejected the transaction. In practice it matches exactly — the browser measures claim #0 at
+20.66%, the same 2066 basis points the chain recorded. Nothing subjective is invented
+client-side.
+
+When the RPC catches up, `client.readContract` against the contract's view methods becomes
+the faster path; the contract exposes `stats`, `list_watches`, `get_watch`, `get_receipt`
+and `get_pending` for exactly that.
+
+## Other rough edges
+
+- **Direct-mode tests need a Windows shim.** `gltest.direct.loader` unlinks a temp file
+  while its descriptor is still open — fine on POSIX, impossible on Windows. See
+  `tests/direct/conftest.py`; delete it once upstream stops doing that.
+- **The explorer API sends no CORS headers**, so in development it is reached through the
+  Vite proxy in `app/vite.config.ts`.
+- **Similarity is crude on purpose.** Comment-stripped token shingles catch verbatim and
+  lightly-edited copies. A determined re-write defeats it. That is the honest scope: this
+  finds vendored code, not laundered code.
+
+## What this is not
+
+The Evidence Receipt records a measurement and a network vote. It is not legal advice and
+it is not a finding of any court. The wording is deliberately neutral — "similarity
+measured at X%, licence text absent" — because publishing an accusation about a named
+project carries real risk, whoever publishes it.

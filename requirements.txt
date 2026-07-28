@@ -1,0 +1,2 @@
+genvm-linter
+genlayer-test>=0.29.2

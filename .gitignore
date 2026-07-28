@@ -1,0 +1,10 @@
+.env
+.env.local
+node_modules/
+dist/
+__pycache__/
+*.pyc
+.venv/
+deployments.local.json
+artifacts/
+.pytest_cache/
