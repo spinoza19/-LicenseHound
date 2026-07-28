@@ -325,7 +325,13 @@ export default function App() {
       <header className="masthead">
         <div className="masthead__brand">
           <h1 className="wordmark">
-            License<em>Hound</em>
+            <button
+              className="wordmark__home"
+              onClick={() => setView({ kind: "idle" })}
+              title="Back to the front page"
+            >
+              License<em>Hound</em>
+            </button>
           </h1>
           <span className="dateline">
             Bradbury Testnet · {new Date().toISOString().slice(0, 10)}

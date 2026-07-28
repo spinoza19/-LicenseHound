@@ -113,6 +113,33 @@ a {
   color: var(--accent);
 }
 
+/* The wordmark is the way home. A button rather than a link because there is no
+   router — it just drops whatever panel is open. */
+.wordmark__home {
+  font: inherit;
+  letter-spacing: inherit;
+  color: inherit;
+  /* `font: inherit` resets these, and the button UA style overrides them */
+  text-transform: inherit;
+  line-height: inherit;
+  background: none;
+  border: 0;
+  padding: 0;
+  margin: 0;
+  cursor: pointer;
+  display: block;
+  transition: opacity 120ms ease;
+}
+
+.wordmark__home:hover {
+  opacity: 0.75;
+}
+
+.wordmark__home:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 4px;
+}
+
 .dateline {
   font-size: 10px;
   letter-spacing: 0.18em;
