@@ -9,7 +9,7 @@ whether the licence was preserved, and asks the validator network the single que
 arithmetic cannot answer — *is this a derivative work?* The escrow settles on the answer,
 and the result is written down as a permanent **Evidence Receipt**.
 
-**Live on Bradbury:** [`0x019a848BD99cE20B11AD094036629b0BbC7Fa5a7`](https://explorer-bradbury.genlayer.com/address/0x019a848BD99cE20B11AD094036629b0BbC7Fa5a7)
+**Live on Bradbury:** [`0x1902d0bFA468eFBF2efF581207D23FAd11624cfD`](https://explorer-bradbury.genlayer.com/address/0x1902d0bFA468eFBF2efF581207D23FAd11624cfD)
 
 ---
 
@@ -50,13 +50,21 @@ model exactly one boolean.**
 
 Re-run on Bradbury with that shape:
 
-| Claim | Case | Consensus | Verdict |
+| Case | Measured | Model | Verdict |
 |---|---|---|---|
-| #0 | `yt-dlp/yt-dlp` vs `ytdl-org/youtube-dl` | 4/5 agree | **COMPLIANT** — derivative, licence preserved |
-| #1 | `psf/requests` vs `ytdl-org/youtube-dl` | 5/5 agree | **UNRELATED** — the hunter loses half the bond |
+| `yt-dlp/yt-dlp` vs `ytdl-org/youtube-dl`, `jsinterp.py` | 20.66% overlap, licence preserved | derivative | **COMPLIANT** |
+| `psf/requests` vs `ytdl-org/youtube-dl` | ~0% overlap | not derivative | **UNRELATED** — the hunter loses half the bond |
 
-Claim #1 is the interesting one: the contract refused to rubber-stamp an accusation and
-charged the accuser for making it.
+The validators' own reasoning on the first one, stored in the receipt:
+
+> The suspect code contains a direct copy of the function name `function_with_repr` imported
+> from utils, replicates the `_js_bit_op` function with the same purpose and similar internal
+> logic, and uses the same unique sentinel class `JS_Undefined`, indicating adaptation rather
+> than independent implementation.
+
+That is the shape the contract is for: yes it was copied, and no that is not a violation,
+because the licence came with it. The second case is the other half — the contract refused
+to rubber-stamp an accusation and charged the accuser for making it.
 
 ### Pinning to a commit SHA
 
@@ -94,12 +102,24 @@ Evidence Receipt is worth having on its own — but they find an empty pool and 
 whole with their bond instead. A hunter is never punished for the pool being gone by the
 time their claim was judged. New claims against a closed watch are rejected outright.
 
+**A claim that cites files which do not exist settles rather than reverting.** Guarding
+`close_watch` on a pending-claim count creates a hostage problem the moment any claim can
+fail to settle. The first version raised `[EXTERNAL] 404` when a cited file was missing, so
+a claim pinned to a plausible-looking but nonexistent SHA reverted every time it was
+adjudicated — `open_claims` never dropped and the bounty was frozen forever, for the price
+of one bond. But a 404 is not a failure: every validator fetches the same URL and every
+validator gets the same answer, which makes "the file is not there" reproducible evidence.
+It now yields an `UNSUBSTANTIATED` verdict without consulting a model at all, charged like
+any other junk claim, and the watch is free again.
+
 Every branch preserves one invariant: **each atto that enters the contract is either a live
 bounty, a bond still in flight, credited to somebody who can withdraw it, or deliberately
 burned.** Nothing may be left owned by a closed watch, because a closed watch can never pay
 out — so the junk-claim penalty that normally tops up the pool goes to the owner once the
-pool is gone. `tests/direct/` asserts this arithmetic end to end, including the closure
-attempt, the bounty-draining violation, and the later claims that follow it.
+pool is gone. Every exit from `adjudicate` runs through one `_settle` method, so the rules
+cannot drift apart between paths. `tests/direct/` asserts this arithmetic end to end,
+including the closure attempt, the bounty-draining violation, the later claims that follow
+it, and the bogus citation that used to hold a bounty hostage.
 
 ## Architecture boundary
 
@@ -144,7 +164,7 @@ CLI, not the app, and reads its key from the gitignored `.env`.
 
 ```
 contracts/license_hound.py      the intelligent contract
-tests/direct/                   direct-mode tests (17, ~0.7s, no server)
+tests/direct/                   direct-mode tests (18, ~0.7s, no server)
 app/                            Vite + React + genlayer-js frontend
 app/src/lib/wallet.ts           EIP-6963 wallet adapter (discovery, chain, events)
 app/src/lib/indexer.ts          rebuilds state from the chain's transaction record

@@ -446,9 +446,13 @@ def test_a_junk_claim_on_a_closed_watch_pays_the_owner_not_a_dead_pool(
     assert credited + burned + int(hound.get_watch("w1")["bounty"]) == deposited
 
 
-def test_a_missing_file_is_reported_as_an_external_error(
+def test_a_claim_citing_a_file_that_does_not_exist_settles_unsubstantiated(
     hound, direct_vm, direct_alice, direct_bob
 ):
+    """Reverting on 404 would freeze the watch: the claim could never settle, so
+    `open_claims` would never drop and the bounty would be locked for the price
+    of one bond and a plausible-looking SHA. A missing file is reproducible
+    evidence, so it settles — and is charged like any other junk claim."""
     open_watch(hound, direct_vm, direct_alice)
     claim_id = file_claim(hound, direct_vm, direct_bob, suspect_path="nope/gone.c")
     mock_files(
@@ -456,5 +460,39 @@ def test_a_missing_file_is_reported_as_an_external_error(
         {raw(ORIGIN_REPO, ORIGIN_SHA, "src/foo.c"): ORIGINAL_SRC},
         missing=[raw(SUSPECT_REPO, SUSPECT_SHA, "nope/gone.c")],
     )
-    with direct_vm.expect_revert("[EXTERNAL]"):
-        hound.adjudicate(claim_id)
+
+    receipt = hound.adjudicate(claim_id)
+    assert receipt["verdict"] == "UNSUBSTANTIATED"
+    assert "nope/gone.c" in receipt["reasoning"]
+    assert receipt["settled"] is True
+
+    # half the bond is forfeited, and the watch is free again
+    assert int(hound.get_pending(hex_of(direct_bob))) == 0
+    watch = hound.get_watch("w1")
+    assert watch["open_claims"] == 0
+    assert watch["closable"] is True
+    assert int(watch["bounty"]) == GEN // 2 + (GEN // 5) // 2
+
+
+def test_a_bogus_citation_cannot_hold_a_bounty_hostage(
+    hound, direct_vm, direct_alice, direct_bob
+):
+    """The griefing path end to end: file an uncheckable claim, then confirm the
+    owner can still get their money out once it is adjudicated away."""
+    open_watch(hound, direct_vm, direct_alice)
+    claim_id = file_claim(hound, direct_vm, direct_bob, suspect_path="nope/gone.c")
+    mock_files(
+        direct_vm,
+        {raw(ORIGIN_REPO, ORIGIN_SHA, "src/foo.c"): ORIGINAL_SRC},
+        missing=[raw(SUSPECT_REPO, SUSPECT_SHA, "nope/gone.c")],
+    )
+
+    direct_vm.sender = direct_alice
+    with direct_vm.expect_revert("awaiting adjudication"):
+        hound.close_watch("w1")
+
+    hound.adjudicate(claim_id)
+
+    direct_vm.sender = direct_alice
+    hound.close_watch("w1")
+    assert int(hound.get_pending(hex_of(direct_alice))) == GEN // 2 + (GEN // 5) // 2

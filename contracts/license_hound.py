@@ -44,6 +44,13 @@ VIOLATION = "VIOLATION"
 COMPLIANT = "COMPLIANT"
 UNRELATED = "UNRELATED"
 INCONCLUSIVE = "INCONCLUSIVE"
+# The cited evidence does not exist at the pinned commit. Penalised like a junk
+# claim: nothing was proven, and the citation was the claimant's to get right.
+UNSUBSTANTIATED = "UNSUBSTANTIATED"
+
+# Sentinel for a file that returned 404. Not a valid file body — no repository
+# ships this — so it cannot be confused with real content.
+MISSING = "\x00__licensehound_missing__"
 
 # Claim lifecycle
 PENDING = "PENDING"
@@ -233,14 +240,21 @@ class LicenseHound(gl.Contract):
         def fetch_code_evidence() -> list:
             out = []
             for pair in pairs:
-                left = _normalize(_raw(origin_repo, origin_sha, pair["origin"]))
-                right = _normalize(_raw(suspect_repo, suspect_sha, pair["suspect"]))
+                origin_raw = _raw(origin_repo, origin_sha, pair["origin"])
+                suspect_raw = _raw(suspect_repo, suspect_sha, pair["suspect"])
+                origin_missing = origin_raw == MISSING
+                suspect_missing = suspect_raw == MISSING
+                left = "" if origin_missing else _normalize(origin_raw)
+                right = "" if suspect_missing else _normalize(suspect_raw)
+                absent = origin_missing or suspect_missing
                 out.append(
                     {
                         "origin_path": pair["origin"],
                         "suspect_path": pair["suspect"],
-                        "byte_identical": left == right,
-                        "jaccard_bp": _jaccard_bp(left, right),
+                        "origin_missing": origin_missing,
+                        "suspect_missing": suspect_missing,
+                        "byte_identical": (not absent) and left == right,
+                        "jaccard_bp": 0 if absent else _jaccard_bp(left, right),
                         "origin_excerpt": left[:MAX_EXCERPT],
                         "suspect_excerpt": right[:MAX_EXCERPT],
                     }
@@ -248,6 +262,28 @@ class LicenseHound(gl.Contract):
             return out
 
         evidence = gl.eq_principle.strict_eq(fetch_code_evidence)
+
+        # A claim that cites files which are not there proves nothing, and there
+        # is no judgment to put to the network — so no model is consulted and no
+        # further fetching happens. Settling it (rather than reverting) is what
+        # keeps a bogus citation from freezing the watch forever.
+        missing = [
+            item["origin_path"] if item["origin_missing"] else item["suspect_path"]
+            for item in evidence
+            if item["origin_missing"] or item["suspect_missing"]
+        ]
+        if missing:
+            return self._settle(
+                claim_id,
+                claim,
+                watch,
+                UNSUBSTANTIATED,
+                0,
+                False,
+                False,
+                "Cited evidence does not exist at the pinned commit: "
+                + ", ".join(missing[:3]),
+            )
 
         # -- Stage 2: attribution. Answered by arithmetic, not by a model.
         #    "Does the suspect ship the same licence the origin ships?" is a
@@ -316,7 +352,30 @@ class LicenseHound(gl.Contract):
             verdict = INCONCLUSIVE
             reasoning = "VETO: a file pair is byte-identical. " + reasoning
 
-        # -- Settlement -------------------------------------------------------
+        return self._settle(
+            claim_id,
+            claim,
+            watch,
+            verdict,
+            max_bp,
+            derivative,
+            attribution_present,
+            reasoning,
+        )
+
+    def _settle(
+        self,
+        claim_id: u256,
+        claim: Claim,
+        watch: Watch,
+        verdict: str,
+        max_bp: int,
+        derivative: bool,
+        attribution_present: bool,
+        reasoning: str,
+    ) -> dict:
+        """The only place money moves. Every exit from `adjudicate` comes
+        through here so the escrow rules cannot drift apart between paths."""
         claim.verdict = verdict
         claim.similarity_bp = u256(max_bp)
         claim.derivative = derivative
@@ -344,10 +403,11 @@ class LicenseHound(gl.Contract):
                 watch.bounty = u256(0)
                 watch.open = False
             self.stat_violations = u256(self.stat_violations + 1)
-        elif verdict == UNRELATED:
+        elif verdict == UNRELATED or verdict == UNSUBSTANTIATED:
             # Junk claim: half the bond is burned, half penalises the reporter in
             # favour of the pool — or of the owner, once there is no pool left to
-            # pay into.
+            # pay into. UNSUBSTANTIATED is charged the same way on purpose: a
+            # citation nobody can check is exactly the abuse the bond deters.
             half = u256(claim.bond // 2)
             if watch.open:
                 watch.bounty = u256(watch.bounty + half)
@@ -553,9 +613,17 @@ def _body_text(body) -> str:
 
 
 def _raw(repo: str, sha: str, path: str) -> str:
+    """Fetch a file that must exist. A 404 here is a fact, not a failure.
+
+    Reverting on 404 looks right and is a denial-of-service hole: the claim can
+    never settle, so `open_claims` never drops and the owner's bounty is frozen
+    for the price of one bond and a plausible-looking SHA. A missing file is
+    perfectly reproducible — every validator gets the same 404 — so it is
+    reported as evidence and the claim settles UNSUBSTANTIATED instead.
+    """
     res = gl.nondet.web.get(_raw_url(repo, sha, path))
     if res.status == 404:
-        raise gl.vm.UserError(f"{ERR_EXTERNAL} 404 {repo}@{sha[:12]}/{path}")
+        return MISSING
     if res.status == 429 or res.status >= 500:
         raise gl.vm.UserError(f"{ERR_TRANSIENT} github status {res.status}")
     if res.status != 200:
