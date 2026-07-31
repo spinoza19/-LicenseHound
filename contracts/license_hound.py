@@ -84,6 +84,9 @@ class Watch:
     license_id: str  # "GPL-3.0", "AGPL-3.0", ...
     bounty: u256  # atto-GEN still payable
     open: bool
+    # Claims filed against this watch that have not been adjudicated yet. The
+    # owner cannot close the watch out from under them while this is non-zero.
+    open_claims: u256
 
 
 @allow_storage
@@ -150,6 +153,7 @@ class LicenseHound(gl.Contract):
             license_id=license_id,
             bounty=u256(gl.message.value),
             open=True,
+            open_claims=u256(0),
         )
         self.watch_ids.append(watch_id)
         # Returned (not just stored) so a client can reconstruct state from the
@@ -203,6 +207,9 @@ class LicenseHound(gl.Contract):
         )
         self.claims_of_watch.get_or_insert_default(watch_id).append(claim_id)
         self.next_claim_id = u256(claim_id + 1)
+        # From here until this claim is adjudicated, the bounty is committed:
+        # `close_watch` will refuse to hand it back to the owner.
+        watch.open_claims = u256(watch.open_claims + 1)
         return claim_id
 
     # -----------------------------------------------------------------------
@@ -317,17 +324,35 @@ class LicenseHound(gl.Contract):
         claim.reasoning = reasoning[:900]
         claim.settled = True
         self.stat_settled = u256(self.stat_settled + 1)
+        if watch.open_claims > 0:
+            watch.open_claims = u256(watch.open_claims - 1)
 
+        # Settlement across several claims on one watch is first-past-the-post:
+        # the first VIOLATION takes the whole bounty and closes the watch. Claims
+        # already in flight still get adjudicated — the Evidence Receipt is worth
+        # having on its own — but they find an empty pool and are made whole with
+        # their bond instead. A hunter is never punished for the pool being gone
+        # by the time their claim was judged.
+        #
+        # Invariant every branch preserves: each atto that entered the contract
+        # is either still a live bounty, still a bond in flight, credited to
+        # somebody who can withdraw it, or deliberately burned. Nothing may be
+        # left owned by a closed watch, because a closed watch can never pay out.
         if verdict == VIOLATION:
-            # Hunter takes the bounty and gets the bond back. Watch closes.
             self._credit(claim.reporter, u256(watch.bounty + claim.bond))
-            watch.bounty = u256(0)
-            watch.open = False
+            if watch.bounty > 0:
+                watch.bounty = u256(0)
+                watch.open = False
             self.stat_violations = u256(self.stat_violations + 1)
         elif verdict == UNRELATED:
-            # Junk claim: half the bond funds the pool, half is burned.
+            # Junk claim: half the bond is burned, half penalises the reporter in
+            # favour of the pool — or of the owner, once there is no pool left to
+            # pay into.
             half = u256(claim.bond // 2)
-            watch.bounty = u256(watch.bounty + half)
+            if watch.open:
+                watch.bounty = u256(watch.bounty + half)
+            else:
+                self._credit(watch.owner, half)
         else:
             # COMPLIANT / INCONCLUSIVE: honest miss, bond returned.
             self._credit(claim.reporter, claim.bond)
@@ -351,11 +376,25 @@ class LicenseHound(gl.Contract):
 
     @gl.public.write
     def close_watch(self, watch_id: str) -> None:
+        """Withdraw a bounty — but never out from under a claim in flight.
+
+        Without the open_claims guard the owner can watch a damaging claim
+        arrive and close the watch before anyone adjudicates it, walking off
+        with the bounty and leaving the hunter with a spent bond and a verdict
+        that pays nothing. Adjudication is permissionless, so an owner who wants
+        out of a watch someone is claiming against can always call `adjudicate`
+        themselves and close once it settles. They cannot skip the judgment.
+        """
         watch = self._watch(watch_id)
         if gl.message.sender_address != watch.owner:
             raise gl.vm.UserError(f"{ERR_EXPECTED} not the watch owner")
         if not watch.open:
             raise gl.vm.UserError(f"{ERR_EXPECTED} already closed")
+        if watch.open_claims > 0:
+            raise gl.vm.UserError(
+                f"{ERR_EXPECTED} {int(watch.open_claims)} claim(s) awaiting "
+                f"adjudication; the bounty is committed until they settle"
+            )
         refund = u256(watch.bounty)
         watch.bounty = u256(0)
         watch.open = False
@@ -382,6 +421,8 @@ class LicenseHound(gl.Contract):
             "license_id": watch.license_id,
             "bounty": str(watch.bounty),
             "open": watch.open,
+            "open_claims": int(watch.open_claims),
+            "closable": watch.open and watch.open_claims == 0,
             "claims": [str(cid) for cid in self.claims_of_watch.get(watch_id, [])],
         }
 
@@ -398,6 +439,7 @@ class LicenseHound(gl.Contract):
                     "license_id": watch.license_id,
                     "bounty": str(watch.bounty),
                     "open": watch.open,
+                    "open_claims": int(watch.open_claims),
                     "claim_count": len(self.claims_of_watch.get(watch_id, [])),
                 }
             )

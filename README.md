@@ -9,7 +9,7 @@ whether the licence was preserved, and asks the validator network the single que
 arithmetic cannot answer — *is this a derivative work?* The escrow settles on the answer,
 and the result is written down as a permanent **Evidence Receipt**.
 
-**Live on Bradbury:** [`0xB27C1896E7Dd6dEcFba355B79De2A4B1e31a339c`](https://explorer-bradbury.genlayer.com/address/0xB27C1896E7Dd6dEcFba355B79De2A4B1e31a339c)
+**Live on Bradbury:** [`0x019a848BD99cE20B11AD094036629b0BbC7Fa5a7`](https://explorer-bradbury.genlayer.com/address/0x019a848BD99cE20B11AD094036629b0BbC7Fa5a7)
 
 ---
 
@@ -75,6 +75,32 @@ to move money. After the vote, the contract overrides:
 - `VIOLATION` + similarity below 15% + nothing byte-identical → `INCONCLUSIVE`
 - `UNRELATED` + a byte-identical file pair → `INCONCLUSIVE`
 
+### Escrow safety
+
+A bounty is a promise to a hunter who has already spent a bond, so the contract holds the
+owner to it.
+
+**A funded watch cannot be closed while a claim is pending.** Without that guard the owner
+can watch a damaging claim arrive and call `close_watch` before anyone adjudicates it,
+walking off with the bounty and leaving the hunter with a spent bond and a verdict that
+pays nothing. `Watch.open_claims` counts claims filed but not yet judged, and `close_watch`
+refuses while it is non-zero. This delays the owner, it does not trap them: `adjudicate` is
+permissionless, so an owner who wants out can resolve the claim themselves and close once
+it settles. What they cannot do is skip the judgment.
+
+**Several claims on one watch settle first-past-the-post.** The first `VIOLATION` takes the
+whole bounty and closes the watch. Claims already in flight are still adjudicated — the
+Evidence Receipt is worth having on its own — but they find an empty pool and are made
+whole with their bond instead. A hunter is never punished for the pool being gone by the
+time their claim was judged. New claims against a closed watch are rejected outright.
+
+Every branch preserves one invariant: **each atto that enters the contract is either a live
+bounty, a bond still in flight, credited to somebody who can withdraw it, or deliberately
+burned.** Nothing may be left owned by a closed watch, because a closed watch can never pay
+out — so the junk-claim penalty that normally tops up the pool goes to the owner once the
+pool is gone. `tests/direct/` asserts this arithmetic end to end, including the closure
+attempt, the bounty-draining violation, and the later claims that follow it.
+
 ## Architecture boundary
 
 | | owns |
@@ -118,7 +144,7 @@ CLI, not the app, and reads its key from the gitignored `.env`.
 
 ```
 contracts/license_hound.py      the intelligent contract
-tests/direct/                   direct-mode tests (11, ~0.4s, no server)
+tests/direct/                   direct-mode tests (17, ~0.7s, no server)
 app/                            Vite + React + genlayer-js frontend
 app/src/lib/wallet.ts           EIP-6963 wallet adapter (discovery, chain, events)
 app/src/lib/indexer.ts          rebuilds state from the chain's transaction record
