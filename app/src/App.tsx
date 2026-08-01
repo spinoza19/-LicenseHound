@@ -5,6 +5,7 @@ import { NewClaim, NewWatch } from "./components/Forms";
 import { Receipt } from "./components/Receipt";
 import { WalletModal } from "./components/WalletModal";
 import { useWallet } from "./lib/wallet";
+import { classifySendError, RETRY_DELAYS_MS, sleep } from "./lib/errors";
 import {
   CONTRACT_ADDRESS,
   EXPLORER,
@@ -144,7 +145,22 @@ export default function App() {
     setView({ kind: "running", stage: 0, note: label });
     say(`${label} · signing`, "run");
     try {
-      const hash = await fn();
+      // Only the submission is retried, and only when the node rejected it
+      // outright. Once a transaction is broadcast, a second attempt would be a
+      // second transaction.
+      let hash: any;
+      for (let attempt = 0; ; attempt++) {
+        try {
+          hash = await fn();
+          break;
+        } catch (error: any) {
+          const failure = classifySendError(error);
+          if (!failure.retryable || attempt >= RETRY_DELAYS_MS.length) throw error;
+          const wait = RETRY_DELAYS_MS[attempt];
+          say(`${label} · ${failure.message} Retrying in ${wait / 1000}s.`, "run");
+          await sleep(wait);
+        }
+      }
       say(`${label} · tx ${short(hash, 8)} submitted`, "run");
       for (let i = 1; i <= stages; i++) setView({ kind: "running", stage: i, note: label });
       const receipt: any = await client.waitForTransactionReceipt({
@@ -165,7 +181,11 @@ export default function App() {
       await refresh();
       return receipt;
     } catch (e: any) {
-      say(`${label} failed: ${e.shortMessage ?? e.message}`, "err");
+      const failure = classifySendError(e);
+      say(`${label} failed · ${failure.message}`, "err");
+      if (failure.retryable) {
+        say("The network never took the transaction — nothing was spent.", "err");
+      }
     } finally {
       setBusy(false);
       setView({ kind: "idle" });

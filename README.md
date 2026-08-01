@@ -222,6 +222,27 @@ their own watch, so exercising the full flow needs two accounts.
 
 ---
 
+## Sequencer backpressure
+
+Bradbury settles to L1 through a zkSync sequencer, and under load that sequencer stops
+taking work:
+
+```
+error code -32603: Node is not currently accepting transactions:
+pipeline backpressure (l1_sender_commit)
+```
+
+Shown raw — as it was to a reviewer mid-demo — that reads like a broken dapp. It is neither
+the contract nor the transaction: the node declined the work before broadcasting anything.
+
+`app/src/lib/errors.ts` classifies failures into a sentence plus one bit: whether the node
+refused the transaction *before* it reached the mempool. Only that class is retried, and
+only the submission, on a 4s / 12s / 30s backoff — resubmitting is safe precisely because
+nothing was broadcast. Everything else (a wallet rejection, insufficient funds, a revert) is
+reported once and left alone, because retrying it would either be futile or would send a
+second transaction. When the retries run out the log says what happened and, more usefully,
+that nothing was spent.
+
 ## Known network limitation
 
 **Bradbury's public RPC currently serves writes but not contract state reads.** Its GenVM
