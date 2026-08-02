@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { CommandBar, type Command } from "./components/CommandBar";
 import { Consensus, STAGES } from "./components/Consensus";
 import { NewClaim, NewWatch } from "./components/Forms";
@@ -31,7 +31,7 @@ type View =
   | { kind: "new-watch" }
   | { kind: "new-claim"; watchId: string }
   | { kind: "receipt"; claimId: number }
-  | { kind: "running"; stage: number; note?: string };
+  | { kind: "running"; stage: number; note?: string; waiting?: string };
 
 type LogLine = { at: string; message: string; kind?: "ok" | "err" | "run" };
 
@@ -43,6 +43,10 @@ export default function App() {
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [walletOpen, setWalletOpen] = useState(false);
   const [measurements, setMeasurements] = useState<Record<number, Measurements>>({});
+
+  // Set while a resubmission is waiting out sequencer backpressure, so the user
+  // is never held for four minutes with no way out.
+  const abort = useRef(false);
 
   const wallet = useWallet();
   const { address, wrongChain } = wallet;
@@ -149,6 +153,7 @@ export default function App() {
       // outright. Once a transaction is broadcast, a second attempt would be a
       // second transaction.
       let hash: any;
+      abort.current = false;
       for (let attempt = 0; ; attempt++) {
         try {
           hash = await fn();
@@ -156,9 +161,24 @@ export default function App() {
         } catch (error: any) {
           const failure = classifySendError(error);
           if (!failure.retryable || attempt >= RETRY_DELAYS_MS.length) throw error;
+          if (abort.current) throw new Error("Cancelled — nothing was sent.");
           const wait = RETRY_DELAYS_MS[attempt];
-          say(`${label} · ${failure.message} Retrying in ${wait / 1000}s.`, "run");
+          say(
+            `${label} · ${failure.message} Retry ${attempt + 1} of ` +
+              `${RETRY_DELAYS_MS.length} in ${wait / 1000}s.`,
+            "run",
+          );
+          setView({
+            kind: "running",
+            stage: 0,
+            note: label,
+            waiting:
+              `The sequencer is shedding load. Attempt ${attempt + 1} of ` +
+              `${RETRY_DELAYS_MS.length}, next in ${wait / 1000}s. ` +
+              `Nothing has been sent or spent.`,
+          });
           await sleep(wait);
+          if (abort.current) throw new Error("Cancelled — nothing was sent.");
         }
       }
       say(`${label} · tx ${short(hash, 8)} submitted`, "run");
@@ -485,7 +505,17 @@ export default function App() {
 
         <main className="col-right">
           <div className="sheet-wrap">
-            {view.kind === "running" && <Consensus stage={view.stage} note={view.note} />}
+            {view.kind === "running" && (
+              <Consensus
+                stage={view.stage}
+                note={view.note}
+                waiting={view.waiting}
+                onCancel={() => {
+                  abort.current = true;
+                  say("cancelling — the transaction was never sent", "run");
+                }}
+              />
+            )}
 
             {view.kind === "new-watch" && (
               <NewWatch

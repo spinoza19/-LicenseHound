@@ -86,7 +86,16 @@ export function classifySendError(error: any): SendFailure {
   return { message: error?.shortMessage ?? error?.message ?? "unknown error", retryable: false };
 }
 
-/** Backoff for resubmission. Short enough to feel live, long enough to matter. */
-export const RETRY_DELAYS_MS = [4000, 12000, 30000];
+/**
+ * Backoff for resubmission, ~4 minutes in total.
+ *
+ * Sized from the network rather than from taste. Measured on 2 Aug 2026 during
+ * a backpressure window: a submission was refused, the same submission landed
+ * on the next attempt about two minutes later, and the chain was accepting
+ * other people's transactions throughout — the sequencer sheds load, it does
+ * not stop. Anything shorter gives up while the network is still saying "not
+ * yet", which is how a working transaction gets reported as a failure.
+ */
+export const RETRY_DELAYS_MS = [4000, 10000, 20000, 30000, 45000, 60000, 60000];
 
 export const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));

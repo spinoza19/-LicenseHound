@@ -28,10 +28,23 @@ export const STAGES = [
   },
 ] as const;
 
-export function Consensus({ stage, note }: { stage: number; note?: string }) {
+export function Consensus({
+  stage,
+  note,
+  waiting,
+  onCancel,
+}: {
+  stage: number;
+  note?: string;
+  /** Set while a submission is waiting out sequencer backpressure. */
+  waiting?: string;
+  onCancel?: () => void;
+}) {
   return (
     <section className="consensus">
-      <h2 className="consensus__title">Judgment in progress</h2>
+      <h2 className="consensus__title">
+        {waiting ? "Waiting for the sequencer" : "Judgment in progress"}
+      </h2>
       <p className="form__sub">
         Five validators are doing this work independently. The transaction only
         settles if their answers survive the equivalence principle.
@@ -42,6 +55,17 @@ export function Consensus({ stage, note }: { stage: number; note?: string }) {
           </>
         )}
       </p>
+
+      {waiting && (
+        <div className="backoff">
+          <p className="backoff__text">{waiting}</p>
+          {onCancel && (
+            <button className="btn btn--ghost" onClick={onCancel}>
+              Stop waiting
+            </button>
+          )}
+        </div>
+      )}
       <div className="stages">
         {STAGES.map((item, index) => (
           <div

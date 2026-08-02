@@ -237,11 +237,22 @@ the contract nor the transaction: the node declined the work before broadcasting
 
 `app/src/lib/errors.ts` classifies failures into a sentence plus one bit: whether the node
 refused the transaction *before* it reached the mempool. Only that class is retried, and
-only the submission, on a 4s / 12s / 30s backoff — resubmitting is safe precisely because
-nothing was broadcast. Everything else (a wallet rejection, insufficient funds, a revert) is
-reported once and left alone, because retrying it would either be futile or would send a
-second transaction. When the retries run out the log says what happened and, more usefully,
-that nothing was spent.
+only the submission — resubmitting is safe precisely because nothing was broadcast.
+Everything else (a wallet rejection, insufficient funds, a revert) is reported once and left
+alone, because retrying it would either be futile or would send a second transaction.
+
+The backoff is sized from the network, not from taste. Measured during a backpressure window
+on 2 Aug 2026:
+
+- a submission was refused, and the same submission landed on the next attempt ~2 minutes later;
+- the chain kept producing blocks throughout, and other people's transactions were being
+  accepted seconds either side of the refusal.
+
+So the sequencer sheds load; it does not stop. A retry window shorter than that is how a
+working transaction gets reported to the user as a failure — which is exactly what happened
+to a reviewer. The backoff now runs 4s / 10s / 20s / 30s / 45s / 60s / 60s, about four
+minutes, with the attempt count and the words "nothing has been sent or spent" on screen
+throughout, and a **Stop waiting** button so nobody is held hostage by the wait.
 
 ## Known network limitation
 
