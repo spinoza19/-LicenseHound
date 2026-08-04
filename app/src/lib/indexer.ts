@@ -1,28 +1,31 @@
 /**
- * Reading LicenseHound without a read endpoint.
+ * Reading LicenseHound.
  *
- * Bradbury's public RPC currently serves writes but not GenVM state reads — its
- * GenVM index sits several hundred thousand blocks behind the chain head, so
- * `gen_call` answers "contract not found" for every contract on the network,
- * not just this one. Waiting for that to catch up is not a plan, so the app
- * reconstructs its own view instead:
+ * The contract is the authority. `stats()` gives the exact number of claims
+ * ever filed, and `get_receipt(id)` answers for each one by its real id, so the
+ * ledger is enumerated from the contract's own counter rather than from
+ * whatever slice of history an index happened to return. There is no window: if
+ * the contract says there are 900 claims, this reads 900 receipts.
  *
- *   1. list the contract's transactions from the explorer index,
- *   2. decode each one's calldata to recover the exact arguments that were
- *      submitted (watch definitions, claims, adjudication requests),
- *   3. for a settled claim, take the ONE non-deterministic value the network
- *      actually voted on — the model's `derivative` boolean — out of the
- *      consensus record,
- *   4. recompute every deterministic input locally (similarity, licence match)
- *      and derive the verdict with the same rules the contract uses.
+ * An earlier version did the opposite — it scanned the explorer's transaction
+ * list, decoded calldata, and *derived* each verdict client-side. Bradbury's
+ * RPC used to answer "contract not found" for every `gen_call` on the network,
+ * so there was nothing else to read. That reconstruction was wrong in three
+ * ways, all of which follow from deriving state instead of reading it:
  *
- * Step 4 is safe precisely because those parts are deterministic by
- * construction: recomputing them here must produce the same numbers the
- * validators produced, or the contract's own equivalence principle would have
- * failed. Nothing subjective is invented client-side.
+ *   - it scanned five pages and stopped, so older claims silently vanished;
+ *   - it numbered claims by scan order, so an id could refer to a different
+ *     claim than the contract meant by it;
+ *   - it inferred a verdict from the model's `derivative` boolean, which does
+ *     not exist for a claim the contract settled without asking a model. An
+ *     UNSUBSTANTIATED claim has no such boolean, so it showed as pending
+ *     forever.
+ *
+ * Reads work now, so none of that is reconstructed any more. The explorer is
+ * still consulted, but only to decorate settled state with transaction hashes
+ * and timestamps for links — it can fail entirely and the ledger is unaffected.
  */
-import { decodeInputData } from "genlayer-js";
-import { CONTRACT_ADDRESS } from "./genlayer";
+import { CONTRACT_ADDRESS, makeClient } from "./genlayer";
 import { fetchRaw, jaccardBp, normalize } from "./github";
 
 // The explorer API answers fine but sends no Access-Control-Allow-Origin, so a
@@ -49,7 +52,8 @@ export type Verdict =
   | "VIOLATION"
   | "COMPLIANT"
   | "UNRELATED"
-  | "INCONCLUSIVE";
+  | "INCONCLUSIVE"
+  | "UNSUBSTANTIATED";
 
 export type Pair = { origin: string; suspect: string };
 
@@ -61,11 +65,14 @@ export type Watch = {
   bountyAtto: bigint;
   owner: string;
   open: boolean;
-  txHash: string;
-  at: number;
+  openClaims: number;
+  claimIds: number[];
+  txHash?: string;
+  at?: number;
 };
 
 export type Claim = {
+  /** The contract's own id. Never a position in a list. */
   claimId: number;
   watchId: string;
   suspectRepo: string;
@@ -73,165 +80,152 @@ export type Claim = {
   pairs: Pair[];
   bondAtto: bigint;
   reporter: string;
-  txHash: string;
-  at: number;
+  /** Authoritative: what the contract stored when it settled. */
   verdict: Verdict;
+  settled: boolean;
+  similarityBp: number;
+  derivative: boolean;
+  attributionPresent: boolean;
+  reasoning: string;
+  txHash?: string;
   judgeTx?: string;
-  derivative?: boolean;
-  reasoning?: string;
+  at?: number;
 };
 
 export type Ledger = { watches: Watch[]; claims: Claim[] };
 
-type RawTx = {
-  hash: string;
-  from_address: string;
-  status: string;
-  execution_result: string;
-  submission_timestamp: number;
-  value: string;
-  data?: { params?: { _calldata?: string } };
-};
+const VERDICTS = new Set<Verdict>([
+  "PENDING",
+  "VIOLATION",
+  "COMPLIANT",
+  "UNRELATED",
+  "INCONCLUSIVE",
+  "UNSUBSTANTIATED",
+]);
 
-async function fetchTransactions(): Promise<RawTx[]> {
-  const out: RawTx[] = [];
-  for (let page = 1; page <= 5; page++) {
-    const url =
-      `${EXPLORER_API}/transactions?address=${CONTRACT_ADDRESS}` +
-      `&response_type=transactions&page=${page}&page_size=50`;
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`explorer ${res.status}`);
-    const body = await res.json();
-    const batch: RawTx[] = body.transactions ?? [];
-    out.push(...batch);
-    if (out.length >= (body.total ?? out.length) || batch.length === 0) break;
-  }
-  return out.sort((a, b) => a.submission_timestamp - b.submission_timestamp);
+const asVerdict = (value: unknown): Verdict =>
+  VERDICTS.has(String(value) as Verdict) ? (String(value) as Verdict) : "PENDING";
+
+// ---------------------------------------------------------------------------
+// Authoritative reads
+// ---------------------------------------------------------------------------
+function reader() {
+  const client = makeClient();
+  return (functionName: string, args: any[] = []) =>
+    client.readContract({
+      address: CONTRACT_ADDRESS,
+      functionName,
+      args,
+      jsonSafeReturn: true,
+    }) as Promise<any>;
 }
 
-function decodeCall(tx: RawTx): { method: string; args: any[] } | null {
-  const raw = tx.data?.params?._calldata;
-  if (!raw) return null;
-  try {
-    const decoded: any = decodeInputData(
-      ("0x" + raw.replace(/^0x/, "")) as `0x${string}`,
-      CONTRACT_ADDRESS,
-    );
-    // calldata decodes into Maps, not plain objects
-    const call = decoded?.callData;
-    const method = call instanceof Map ? call.get("method") : call?.method;
-    const args = call instanceof Map ? call.get("args") : call?.args;
-    if (!method) return null;
-    return { method: String(method), args: (args ?? []).map(String) };
-  } catch {
-    return null;
-  }
-}
-
-/** The model's answer, lifted straight out of the consensus record. */
-function extractDerivative(txJson: string): { derivative: boolean; reasoning: string } | null {
-  const match = txJson.match(/\{\\?"derivative\\?":\s*(true|false)[^}]*\}/);
-  if (!match) return null;
-  try {
-    const parsed = JSON.parse(match[0].replace(/\\"/g, '"'));
-    return {
-      derivative: Boolean(parsed.derivative),
-      reasoning: String(parsed.reasoning ?? ""),
-    };
-  } catch {
-    return { derivative: match[1] === "true", reasoning: "" };
-  }
-}
-
-async function fetchJudgement(hash: string) {
-  const res = await fetch(`${EXPLORER_API}/transactions/${hash}`);
-  if (!res.ok) return null;
-  return extractDerivative(JSON.stringify(await res.json()));
+/** Bound concurrency so a large docket does not open 900 sockets at once. */
+async function mapLimit<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const out = new Array<R>(items.length);
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    for (let i = cursor++; i < items.length; i = cursor++) out[i] = await fn(items[i]);
+  });
+  await Promise.all(workers);
+  return out;
 }
 
 export async function loadLedger(): Promise<Ledger> {
-  const txs = await fetchTransactions();
-  const watches: Watch[] = [];
-  const claims: Claim[] = [];
-  const judged = new Map<number, { hash: string }>();
-  let nextClaimId = 0;
+  const read = reader();
 
-  for (const tx of txs) {
-    if (tx.execution_result !== "FINISHED_WITH_RETURN") continue;
-    const call = decodeCall(tx);
-    if (!call) continue;
+  const [stats, listed] = await Promise.all([read("stats"), read("list_watches")]);
 
-    if (call.method === "open_watch") {
-      const [watchId, originRepo, originSha, licenseId] = call.args;
-      watches.push({
-        watchId,
-        originRepo,
-        originSha,
-        licenseId,
-        bountyAtto: BigInt(tx.value || "0"),
-        owner: tx.from_address,
-        open: true,
-        txHash: tx.hash,
-        at: tx.submission_timestamp,
-      });
-    } else if (call.method === "top_up") {
-      const watch = watches.find((w) => w.watchId === call.args[0]);
-      if (watch) watch.bountyAtto += BigInt(tx.value || "0");
-    } else if (call.method === "file_claim") {
-      const [watchId, suspectRepo, suspectSha, pairsJson] = call.args;
-      let pairs: Pair[] = [];
-      try {
-        pairs = JSON.parse(pairsJson);
-      } catch {
-        /* the contract already rejected malformed input */
-      }
-      claims.push({
-        claimId: nextClaimId++,
-        watchId,
-        suspectRepo,
-        suspectSha,
-        pairs,
-        bondAtto: BigInt(tx.value || "0"),
-        reporter: tx.from_address,
-        txHash: tx.hash,
-        at: tx.submission_timestamp,
-        verdict: "PENDING",
-      });
-    } else if (call.method === "adjudicate") {
-      judged.set(Number(call.args[0]), { hash: tx.hash });
-    } else if (call.method === "close_watch") {
-      const watch = watches.find((w) => w.watchId === call.args[0]);
-      if (watch) watch.open = false;
-    }
-  }
+  // Every watch, with its owner and the claim ids the contract associates with
+  // it — not an ordering this file invented.
+  const watches: Watch[] = await mapLimit(listed ?? [], 6, async (row: any) => {
+    const full = await read("get_watch", [row.watch_id]);
+    return {
+      watchId: String(row.watch_id),
+      originRepo: String(row.origin_repo),
+      originSha: String(row.origin_sha),
+      licenseId: String(row.license_id),
+      bountyAtto: BigInt(row.bounty ?? "0"),
+      owner: String(full?.owner ?? ""),
+      open: Boolean(row.open),
+      openClaims: Number(row.open_claims ?? 0),
+      claimIds: (full?.claims ?? []).map((id: any) => Number(id)),
+    };
+  });
 
-  // Attach the consensus decision to each judged claim.
-  await Promise.all(
-    [...judged.entries()].map(async ([claimId, { hash }]) => {
-      const claim = claims.find((c) => c.claimId === claimId);
-      if (!claim) return;
-      claim.judgeTx = hash;
-      const judgement = await fetchJudgement(hash);
-      if (!judgement) return;
-      claim.derivative = judgement.derivative;
-      claim.reasoning = judgement.reasoning;
-    }),
+  // `stats.claims` is the contract's next_claim_id: every id ever issued.
+  const total = Number(stats?.claims ?? 0);
+  const ids = Array.from({ length: total }, (_, i) => i);
+  const receipts = await mapLimit(ids, 8, (id) =>
+    read("get_receipt", [BigInt(id)]).catch(() => null),
   );
 
+  const claims: Claim[] = [];
+  receipts.forEach((receipt, id) => {
+    if (!receipt) return;
+    claims.push({
+      claimId: Number(receipt.claim_id ?? id),
+      watchId: String(receipt.watch_id ?? ""),
+      suspectRepo: String(receipt.suspect?.repo ?? ""),
+      suspectSha: String(receipt.suspect?.sha ?? ""),
+      pairs: (receipt.pairs ?? []) as Pair[],
+      bondAtto: BigInt(receipt.bond ?? "0"),
+      reporter: String(receipt.reporter ?? ""),
+      verdict: asVerdict(receipt.verdict),
+      settled: Boolean(receipt.settled),
+      similarityBp: Number(receipt.similarity_bp ?? 0),
+      derivative: Boolean(receipt.derivative),
+      attributionPresent: Boolean(receipt.attribution_present),
+      reasoning: String(receipt.reasoning ?? ""),
+    });
+  });
+
+  await decorateWithTransactions(watches, claims);
   return { watches, claims };
 }
 
 /**
- * A claim's verdict, in the same order the contract derives it. Before the
- * local measurements arrive the answer is genuinely unknown, so it stays
- * PENDING rather than guessing.
+ * Best-effort only. Transaction hashes and timestamps make the receipt
+ * linkable; they are not state, so every failure here is swallowed. Nothing
+ * displayed as fact depends on this succeeding.
  */
-export function verdictOf(claim: Claim, m?: Measurements): Verdict {
-  if (!claim.judgeTx || claim.derivative === undefined) return "PENDING";
-  if (!m) return "PENDING";
-  return deriveVerdict(claim.derivative, m).verdict;
+async function decorateWithTransactions(watches: Watch[], claims: Claim[]) {
+  try {
+    const res = await fetch(
+      `${EXPLORER_API}/transactions?address=${CONTRACT_ADDRESS}` +
+        `&response_type=transactions&page=1&page_size=50`,
+    );
+    if (!res.ok) return;
+    const body = await res.json();
+    const txs: any[] = body.transactions ?? [];
+
+    for (const tx of txs) {
+      const raw = JSON.stringify(tx);
+      for (const watch of watches) {
+        if (!watch.txHash && raw.includes(`"${watch.watchId}"`)) {
+          watch.txHash = tx.hash;
+          watch.at = tx.submission_timestamp;
+        }
+      }
+      for (const claim of claims) {
+        if (!claim.txHash && raw.includes(claim.suspectSha)) {
+          claim.txHash = tx.hash;
+          claim.at = tx.submission_timestamp;
+        }
+      }
+    }
+  } catch {
+    /* links are a nicety; the ledger already stands on its own */
+  }
 }
 
+// ---------------------------------------------------------------------------
+// Independent verification
+// ---------------------------------------------------------------------------
 export type Measurements = {
   similarityBp: number;
   anyIdentical: boolean;
@@ -249,9 +243,12 @@ async function bestLicense(repo: string, sha: string): Promise<string> {
 }
 
 /**
- * Re-run the contract's deterministic stages in the browser. These must match
- * the on-chain numbers; if they ever drift, the equivalence principle would
- * have rejected the transaction in the first place.
+ * Re-run the contract's deterministic stages in the browser.
+ *
+ * This is a check, never a source. The verdict shown to the user is the one the
+ * contract stored; this exists so a reader can confirm the numbers behind it
+ * without trusting either the contract or this page — the inputs are pinned to
+ * immutable commits, so the arithmetic must land on the same answer.
  */
 export async function measure(
   origin: { repo: string; sha: string },
@@ -291,7 +288,7 @@ export async function measure(
   };
 }
 
-/** The contract's Stage 4, mirrored exactly. */
+/** The contract's Stage 4, mirrored — used only to check its answer. */
 export function deriveVerdict(
   derivative: boolean,
   m: Measurements,
@@ -305,4 +302,20 @@ export function deriveVerdict(
   if (m.similarityBp < MIN_JACCARD_BP && !m.anyIdentical)
     return { verdict: "INCONCLUSIVE", veto: "measured similarity below threshold" };
   return { verdict: "VIOLATION" };
+}
+
+/**
+ * Does the browser's own arithmetic agree with what the contract stored?
+ *
+ * Only meaningful for verdicts that came from the deterministic pipeline. An
+ * UNSUBSTANTIATED claim was settled without measuring anything, so there is
+ * nothing to re-derive and nothing to disagree about.
+ */
+export function checkAgainstContract(
+  claim: Claim,
+  m?: Measurements,
+): { checked: boolean; agrees: boolean } {
+  if (!m || !claim.settled || claim.verdict === "UNSUBSTANTIATED")
+    return { checked: false, agrees: true };
+  return { checked: true, agrees: deriveVerdict(claim.derivative, m).verdict === claim.verdict };
 }

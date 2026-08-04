@@ -1,5 +1,5 @@
 import type { Claim, Measurements, Watch } from "../lib/indexer";
-import { MIN_JACCARD_BP, deriveVerdict } from "../lib/indexer";
+import { MIN_JACCARD_BP, checkAgainstContract } from "../lib/indexer";
 import { EXPLORER, short, toGen } from "../lib/genlayer";
 
 const bp = (value: number) => `${(value / 100).toFixed(2)}%`;
@@ -13,11 +13,10 @@ export function Receipt({
   watch: Watch;
   measurements?: Measurements;
 }) {
-  const derived =
-    claim.derivative !== undefined && measurements
-      ? deriveVerdict(claim.derivative, measurements)
-      : null;
-  const verdict = derived?.verdict ?? claim.verdict;
+  // The contract's stored verdict is the receipt. The browser's own
+  // re-measurement is shown beside it as a check, never in place of it.
+  const verdict = claim.verdict;
+  const check = checkAgainstContract(claim, measurements);
 
   return (
     <article className="sheet">
@@ -37,7 +36,9 @@ export function Receipt({
         <div className="sheet__id">
           claim #{claim.claimId}
           <br />
-          {new Date(claim.at * 1000).toISOString().slice(0, 16).replace("T", " ")}
+          {claim.at
+            ? new Date(claim.at * 1000).toISOString().slice(0, 16).replace("T", " ")
+            : "on chain"}
         </div>
       </header>
 
@@ -66,11 +67,18 @@ export function Receipt({
 
         <div className="k">Derivative work</div>
         <div className="v">
-          {claim.derivative === undefined
+          {!claim.settled
             ? "not yet judged"
-            : claim.derivative
-              ? "yes — decided by validator consensus"
-              : "no — decided by validator consensus"}
+            : claim.verdict === "UNSUBSTANTIATED"
+              ? "not assessed — the cited files do not exist at the pinned commit, so no model was asked"
+              : claim.derivative
+                ? "yes — decided by validator consensus"
+                : "no — decided by validator consensus"}
+        </div>
+
+        <div className="k">Similarity (on chain)</div>
+        <div className="v">
+          {bp(claim.similarityBp)} — stored by the contract when it settled
         </div>
 
         <div className="k">Licence preserved</div>
@@ -90,10 +98,14 @@ export function Receipt({
           {toGen(claim.bondAtto)} GEN bonded · {toGen(watch.bountyAtto)} GEN at stake
         </div>
 
-        {derived?.veto && (
+        {check.checked && (
           <>
-            <div className="k">Deterministic veto</div>
-            <div className="v">{derived.veto}</div>
+            <div className="k">Independent check</div>
+            <div className="v">
+              {check.agrees
+                ? "this browser re-fetched both files and re-derived the same verdict"
+                : "this browser re-derived a different verdict — the contract's answer stands, but the inputs are worth a look"}
+            </div>
           </>
         )}
       </div>
@@ -112,7 +124,7 @@ export function Receipt({
             />
           </div>
           <div className="gauge__legend">
-            <span>measured similarity {bp(measurements.similarityBp)}</span>
+            <span>re-measured here {bp(measurements.similarityBp)}</span>
             <span>threshold {bp(MIN_JACCARD_BP)}</span>
           </div>
         </div>

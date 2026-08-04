@@ -125,8 +125,8 @@ it, and the bogus citation that used to hold a bounty hostage.
 
 | | owns |
 |---|---|
-| **Frontend** | UI, branch→SHA resolution, non-authoritative similarity previews, indexing |
-| **Contract** | escrow, evidence acquisition, the judgment, settlement, the receipt |
+| **Frontend** | UI, branch→SHA resolution, independent re-measurement offered as a check |
+| **Contract** | escrow, evidence acquisition, the judgment, settlement, and the authoritative receipt state the UI reads |
 | **GitHub** | raw facts, trusted by nobody — every validator re-fetches independently |
 | **Wallet** | keys and signatures — the page never sees either |
 
@@ -167,7 +167,7 @@ contracts/license_hound.py      the intelligent contract
 tests/direct/                   direct-mode tests (18, ~0.7s, no server)
 app/                            Vite + React + genlayer-js frontend
 app/src/lib/wallet.ts           EIP-6963 wallet adapter (discovery, chain, events)
-app/src/lib/indexer.ts          rebuilds state from the chain's transaction record
+app/src/lib/indexer.ts          reads authoritative receipt state from the contract
 app/scripts/ops.mjs             operator CLI for payable calls
 app/scripts/verdict.mjs         recovers a decision from a transaction
 ```
@@ -254,38 +254,33 @@ to a reviewer. The backoff now runs 4s / 10s / 20s / 30s / 45s / 60s / 60s, abou
 minutes, with the attempt count and the words "nothing has been sent or spent" on screen
 throughout, and a **Stop waiting** button so nobody is held hostage by the wait.
 
-## Known network limitation
+## Reading state
 
-**Bradbury's public RPC currently serves writes but not contract state reads.** Its GenVM
-index sits several hundred thousand blocks behind the chain head:
+The contract is the authority. `stats()` reports how many claims have ever been filed and
+`get_receipt(id)` answers for each one by its real id, so the ledger is enumerated from the
+contract's own counter — no page limit, no history window. If the contract says there are
+900 claims, the app reads 900 receipts. The explorer is still consulted, but only to attach
+transaction hashes for links; it can fail completely and the ledger is unaffected.
 
-```
-requested block 15865053 is ahead of GenVM synced block 15467203
-(397850 blocks behind): genvm not synced
-```
+This replaced a reconstruction, and the reason it had to is worth recording. Bradbury's RPC
+used to answer *"contract not found"* for **every** `gen_call` on the network — its GenVM
+index sat ~400k blocks behind the chain head — so there was nothing authoritative to read
+and the app rebuilt its view by scanning the explorer's transaction list and decoding
+calldata. That worked, and it was wrong in three ways that all follow from deriving state
+instead of reading it:
 
-Consequently `gen_call` answers *"contract not found"* for **every** contract on the
-network — verified against three unrelated contracts from the explorer's list, not just
-this one. `genlayer call`, `genlayer schema`, and the trace endpoint are all affected.
+- it scanned five pages and stopped, so older claims silently disappeared;
+- it numbered claims by scan order, so an id could mean a different claim than the contract
+  meant by it;
+- it inferred each verdict from the model's `derivative` boolean — which does not exist for
+  a claim the contract settled *without asking a model*. An `UNSUBSTANTIATED` claim has no
+  such boolean, so it showed as pending forever.
 
-The app does not wait for that. `app/src/lib/indexer.ts` rebuilds its view instead:
-
-1. list the contract's transactions from the explorer index,
-2. decode each one's calldata to recover the arguments that were submitted,
-3. lift the one non-deterministic value the network actually voted on — the model's
-   `derivative` boolean — out of the consensus record,
-4. recompute every deterministic input locally and derive the verdict with the contract's
-   own rules.
-
-Step 4 is only legitimate because those stages are deterministic by construction: if
-recomputing them locally could disagree with the validators, `strict_eq` would have
-rejected the transaction. In practice it matches exactly — the browser measures claim #0 at
-20.66%, the same 2066 basis points the chain recorded. Nothing subjective is invented
-client-side.
-
-When the RPC catches up, `client.readContract` against the contract's view methods becomes
-the faster path; the contract exposes `stats`, `list_watches`, `get_watch`, `get_receipt`
-and `get_pending` for exactly that.
+Reads work now, so none of that is derived any more. What survives is the part that was
+always worth having: the browser independently re-fetches both files at their pinned commits
+and recomputes the similarity, then says whether it lands on the same verdict the contract
+stored. Claim #0 reads 20.66% on chain and re-measures to 20.66% here. That is a check on
+the contract's arithmetic, offered as a check — not a substitute for its answer.
 
 ## Other rough edges
 

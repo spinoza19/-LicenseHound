@@ -18,7 +18,6 @@ import {
 import {
   loadLedger,
   measure,
-  verdictOf,
   type Claim,
   type Ledger,
   type Measurements,
@@ -96,7 +95,7 @@ export default function App() {
   // Deterministic re-measurement for judged claims, done lazily.
   useEffect(() => {
     const pending = ledger.claims.filter(
-      (claim) => claim.derivative !== undefined && !measurements[claim.claimId],
+      (claim) => claim.settled && !measurements[claim.claimId],
     );
     if (pending.length === 0) return;
     let cancelled = false;
@@ -248,7 +247,7 @@ export default function App() {
       disabled: !selectedWatch,
     },
     ...ledger.claims
-      .filter((claim) => !claim.judgeTx)
+      .filter((claim) => !claim.settled)
       .map((claim) => ({
         id: `judge-${claim.claimId}`,
         glyph: "§",
@@ -258,7 +257,7 @@ export default function App() {
         run: () => judge(claim.claimId),
       })),
     ...ledger.claims
-      .filter((claim) => claim.judgeTx)
+      .filter((claim) => claim.settled)
       .map((claim) => ({
         id: `receipt-${claim.claimId}`,
         glyph: "▤",
@@ -340,20 +339,12 @@ export default function App() {
     },
   ];
 
-  const settled = ledger.claims.filter((c) => c.judgeTx).length;
-  const violations = ledger.claims.filter(
-    (c) => verdictOf(c, measurements[c.claimId]) === "VIOLATION",
-  ).length;
+  const settled = ledger.claims.filter((c) => c.settled).length;
+  const violations = ledger.claims.filter((c) => c.verdict === "VIOLATION").length;
 
-  // A watch is spent the moment one of its claims lands a violation — the
-  // bounty was paid out even though only the contract's own state says so.
-  const isOpen = (watch: Watch) =>
-    watch.open &&
-    !ledger.claims.some(
-      (c) =>
-        c.watchId === watch.watchId &&
-        verdictOf(c, measurements[c.claimId]) === "VIOLATION",
-    );
+  // The contract already closes a watch when a violation drains it, so its own
+  // `open` flag is the answer — no need to infer it from the claims.
+  const isOpen = (watch: Watch) => watch.open;
 
   const pool = ledger.watches.reduce(
     (sum, w) => sum + (isOpen(w) ? w.bountyAtto : 0n),
@@ -570,7 +561,6 @@ export default function App() {
               <WatchDetail
                 watch={selectedWatch}
                 claims={ledger.claims.filter((c) => c.watchId === selectedWatch.watchId)}
-                measurements={measurements}
                 open={isOpen(selectedWatch)}
                 canWrite={canWrite}
                 onClaim={() =>
@@ -616,7 +606,6 @@ export default function App() {
 function WatchDetail({
   watch,
   claims,
-  measurements,
   open,
   canWrite,
   onClaim,
@@ -625,7 +614,6 @@ function WatchDetail({
 }: {
   watch: Watch;
   claims: Claim[];
-  measurements: Record<number, Measurements>;
   open: boolean;
   canWrite: boolean;
   onClaim: () => void;
@@ -669,25 +657,22 @@ function WatchDetail({
           </div>
         )}
         <div className="claims-strip">
-          {claims.map((claim) => {
-            const verdict = verdictOf(claim, measurements[claim.claimId]);
-            return (
-              <button
-                key={claim.claimId}
-                className="claim-chip"
-                onClick={() =>
-                  claim.judgeTx ? onOpenReceipt(claim.claimId) : onJudge(claim.claimId)
-                }
-                disabled={!claim.judgeTx && !canWrite}
-              >
-                <span>#{claim.claimId}</span>
-                <span style={{ color: "var(--ink-dim)" }}>{claim.suspectRepo}</span>
-                <span className="pill" data-v={verdict}>
-                  {claim.judgeTx ? verdict : "judge it"}
-                </span>
-              </button>
-            );
-          })}
+          {claims.map((claim) => (
+            <button
+              key={claim.claimId}
+              className="claim-chip"
+              onClick={() =>
+                claim.settled ? onOpenReceipt(claim.claimId) : onJudge(claim.claimId)
+              }
+              disabled={!claim.settled && !canWrite}
+            >
+              <span>#{claim.claimId}</span>
+              <span style={{ color: "var(--ink-dim)" }}>{claim.suspectRepo}</span>
+              <span className="pill" data-v={claim.verdict}>
+                {claim.settled ? claim.verdict : "judge it"}
+              </span>
+            </button>
+          ))}
         </div>
       </div>
     </section>
